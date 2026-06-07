@@ -260,7 +260,7 @@ def evaluar_posiciones(cartera, datos_activos):
     alertas = []
     posiciones = cartera.get("posiciones", {})
 
-    for ticker, pos in posiciones.items():
+    for ticker, pos in list(posiciones.items()):
         precio_entrada = pos["precio_entrada"]
         precio_actual = pos.get("precio_actual", precio_entrada)
 
@@ -272,7 +272,8 @@ def evaluar_posiciones(cartera, datos_activos):
                 "tipo": "STOP_LOSS",
                 "motivo": f"Caida {cambio_pct:.1f}% <= {STOP_LOSS_PCT}%",
                 "precio_entrada": precio_entrada,
-                "precio_actual": precio_actual
+                "precio_actual": precio_actual,
+                "auto_ejecutar": True
             })
             continue
 
@@ -284,10 +285,69 @@ def evaluar_posiciones(cartera, datos_activos):
                 "tipo": "TENDENCIA_ROTA",
                 "motivo": "SMA10 < SMA50, tendencia invertida",
                 "precio_entrada": precio_entrada,
-                "precio_actual": precio_actual
+                "precio_actual": precio_actual,
+                "auto_ejecutar": True
             })
 
     return alertas
+
+def ejecutar_venta(cartera, ticker, precio_actual, motivo):
+    """Ejecuta venta automatica: libera capital y registra."""
+    if ticker not in cartera["posiciones"]:
+        return False
+
+    pos = cartera["posiciones"][ticker]
+    capital_liberado = pos.get("capital", 0)
+
+    # Actualizar capital
+    cartera["capital_disponible"] += capital_liberado
+
+    # Registrar en historial
+    cartera["historial"].append({
+        "fecha": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "accion": "VENTA",
+        "ticker": ticker,
+        "precio_entrada": pos["precio_entrada"],
+        "precio_salida": precio_actual,
+        "capital_liberado": capital_liberado,
+        "motivo": motivo
+    })
+
+    # Eliminar posicion
+    del cartera["posiciones"][ticker]
+
+    return True
+
+def ejecutar_compra(cartera, ticker, precio, capital=MAX_POR_ACCION):
+    """Ejecuta compra automatica: reserva capital y registra."""
+    if capital > cartera["capital_disponible"]:
+        return False, "Capital insuficiente"
+    if len(cartera["posiciones"]) >= MAX_POSICIONES:
+        return False, "Cartera llena"
+
+    cantidad = capital / precio
+
+    cartera["posiciones"][ticker] = {
+        "precio_entrada": precio,
+        "cantidad": cantidad,
+        "capital": capital,
+        "fecha": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "precio_actual": precio
+    }
+
+    cartera["capital_disponible"] -= capital
+    cartera["compras_esta_semana"] += 1
+
+    cartera["historial"].append({
+        "fecha": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "accion": "COMPRA",
+        "ticker": ticker,
+        "precio": precio,
+        "cantidad": cantidad,
+        "capital": capital
+    })
+
+    return True, "OK"
 
 # ============================================================================
 # STREAMLIT UI
@@ -331,6 +391,13 @@ with pestaña1:
 
     st.write("---")
 
+    # MODO AUTOMÁTICO vs MANUAL
+    modo_auto = st.toggle("🤖 Modo Automático (ejecuta ventas/compras sin confirmar)", value=False, key="modo_auto")
+    if modo_auto:
+        st.warning("⚠️ MODO AUTÓNOMO: El bot ejecutará ventas y compras automáticamente. Revisa el historial.")
+
+    st.write("---")
+
     # Botón ejecutar análisis
     if st.button("🔄 Ejecutar Análisis Completo", type="primary"):
         with st.spinner("Descargando datos de mercado..."):
@@ -362,10 +429,14 @@ with pestaña1:
                     resultados.append({
                         "Ticker": ticker,
                         "Score": score,
-                        "Precio": f"{precio:.2f}€",
+                        "Precio": precio,
+                        "PrecioStr": f"{precio:.2f}€",
                         "Tendencia": "✅ Alcista" if metricas["tendencia_alcista"] else "❌ Bajista",
+                        "TendenciaBool": metricas["tendencia_alcista"],
                         "Momentum": f"{metricas['momentum']:.1f}%",
+                        "MomentumNum": metricas['momentum'],
                         "Upside": f"{metricas['upside']:.1f}%" if metricas['upside'] else "N/A",
+                        "UpsideNum": metricas['upside'],
                         "SMA10": f"{metricas['sma10']:.2f}",
                         "SMA50": f"{metricas['sma50']:.2f}",
                         "Motivos": " | ".join(motivos)
@@ -380,13 +451,19 @@ with pestaña1:
                 df_resultados = df_resultados.sort_values("Score", ascending=False)
 
                 st.write("### 🏆 Ranking del Universo")
-                st.dataframe(df_resultados, use_container_width=True)
+                st.dataframe(df_resultados[["Ticker", "Score", "PrecioStr", "Tendencia", "Momentum", "Upside", "Motivos"]], 
+                           use_container_width=True)
 
                 # Identificar top 10
                 top10 = df_resultados.head(10)
                 st.write("### 🎯 Top 10 Oportunidades")
-                st.dataframe(top10[["Ticker", "Score", "Precio", "Tendencia", "Momentum", "Upside"]], 
+                st.dataframe(top10[["Ticker", "Score", "PrecioStr", "Tendencia", "Momentum", "Upside"]], 
                            use_container_width=True)
+
+                # Actualizar precios actuales en cartera
+                for _, row in df_resultados.iterrows():
+                    if row["Ticker"] in cartera["posiciones"]:
+                        cartera["posiciones"][row["Ticker"]]["precio_actual"] = row["Precio"]
 
                 # Evaluar posiciones actuales
                 if cartera["posiciones"]:
@@ -396,7 +473,7 @@ with pestaña1:
                     datos_activos = {}
                     for _, row in df_resultados.iterrows():
                         datos_activos[row["Ticker"]] = {
-                            "tendencia_alcista": "✅" in row["Tendencia"],
+                            "tendencia_alcista": row["TendenciaBool"],
                             "score": row["Score"]
                         }
 
@@ -408,10 +485,16 @@ with pestaña1:
                                 st.error(f"🛑 {alerta['ticker']}: {alerta['motivo']} | "
                                         f"Entrada: {alerta['precio_entrada']:.2f}€ | "
                                         f"Actual: {alerta['precio_actual']:.2f}€")
+                                if modo_auto:
+                                    ejecutar_venta(cartera, alerta['ticker'], alerta['precio_actual'], alerta['motivo'])
+                                    st.success(f"✅ VENTA AUTOMÁTICA ejecutada: {alerta['ticker']}")
                             elif alerta["tipo"] == "TENDENCIA_ROTA":
                                 st.warning(f"⚠️ {alerta['ticker']}: {alerta['motivo']} | "
                                           f"Entrada: {alerta['precio_entrada']:.2f}€ | "
                                           f"Actual: {alerta['precio_actual']:.2f}€")
+                                if modo_auto:
+                                    ejecutar_venta(cartera, alerta['ticker'], alerta['precio_actual'], alerta['motivo'])
+                                    st.success(f"✅ VENTA AUTOMÁTICA ejecutada: {alerta['ticker']}")
                     else:
                         st.success("✅ Todas las posiciones están dentro de parámetros")
 
@@ -435,9 +518,24 @@ with pestaña1:
                         st.write("**Sustituciones sugeridas:**")
                         for nuevo in top_no_en_cartera:
                             # Encontrar la peor posición actual
-                            peor = min(cartera["posiciones"].items(), 
-                                      key=lambda x: datos_activos.get(x[0], {}).get("score", 0))
-                            st.write(f"🔄 Vender {peor[0]} → Comprar {nuevo}")
+                            peor_ticker = min(cartera["posiciones"].keys(), 
+                                            key=lambda x: datos_activos.get(x, {}).get("score", 0))
+                            peor_score = datos_activos.get(peor_ticker, {}).get("score", 0)
+                            nuevo_score = datos_activos.get(nuevo, {}).get("score", 0)
+
+                            if nuevo_score > peor_score:
+                                st.write(f"🔄 Vender {peor_ticker} (Score {peor_score}) → Comprar {nuevo} (Score {nuevo_score})")
+                                if modo_auto:
+                                    precio_nuevo = df_resultados[df_resultados["Ticker"] == nuevo]["Precio"].iloc[0]
+                                    ejecutar_venta(cartera, peor_ticker, 
+                                                   cartera["posiciones"][peor_ticker].get("precio_actual", 0),
+                                                   f"Sustitución por {nuevo}")
+                                    ejecutar_compra(cartera, nuevo, precio_nuevo)
+                                    st.success(f"✅ SUSTITUCIÓN AUTOMÁTICA: {peor_ticker} → {nuevo}")
+                            else:
+                                st.write(f"⏸️ {nuevo} no supera a {peor_ticker}, no se sustituye")
+                    else:
+                        st.info("No hay mejores oportunidades fuera de cartera")
                 else:
                     # Compras directas
                     top_no_en_cartera = [t for t in top10["Ticker"].tolist() 
@@ -447,34 +545,74 @@ with pestaña1:
                         st.write(f"**Compras recomendadas (max {COMPRAS_SEMANALES_MAX} esta semana):**")
                         for ticker in top_no_en_cartera:
                             row = df_resultados[df_resultados["Ticker"] == ticker].iloc[0]
-                            st.success(f"🟢 {ticker}: Score {row['Score']}/10 | {row['Precio']} | "
+                            st.success(f"🟢 {ticker}: Score {row['Score']}/10 | {row['PrecioStr']} | "
                                       f"Momentum: {row['Momentum']} | Upside: {row['Upside']}")
+                            if modo_auto:
+                                ok, msg = ejecutar_compra(cartera, ticker, row["Precio"])
+                                if ok:
+                                    st.success(f"✅ COMPRA AUTOMÁTICA ejecutada: {ticker}")
+                                else:
+                                    st.error(f"❌ Error compra {ticker}: {msg}")
                     else:
                         st.info("Todas las top oportunidades ya están en cartera")
+
+                # Guardar cartera tras análisis
+                guardar_cartera(cartera)
             else:
                 st.warning("No se pudieron analizar activos")
 
-    # Mostrar cartera actual
+    # Mostrar cartera actual con P&L
     st.write("---")
     st.write("### 📁 Cartera Actual")
 
     if cartera["posiciones"]:
         datos_pos = []
         for ticker, pos in cartera["posiciones"].items():
+            precio_entrada = pos["precio_entrada"]
+            precio_actual = pos.get("precio_actual", precio_entrada)
+            cantidad = pos.get("cantidad", 0)
+            capital = pos.get("capital", 0)
+
+            valor_actual = precio_actual * cantidad if cantidad > 0 else capital
+            pnl_valor = valor_actual - capital
+            pnl_pct = ((precio_actual - precio_entrada) / precio_entrada * 100) if precio_entrada > 0 else 0
+
             datos_pos.append({
                 "Ticker": ticker,
-                "Precio Entrada": f"{pos['precio_entrada']:.2f}€",
-                "Cantidad": pos.get("cantidad", 0),
-                "Capital": f"{pos.get('capital', 0):.2f}€",
-                "Fecha": pos.get("fecha", "N/A")
+                "Precio Entrada": f"{precio_entrada:.2f}€",
+                "Precio Actual": f"{precio_actual:.2f}€" if precio_actual != precio_entrada else "—",
+                "Cantidad": f"{cantidad:.4f}",
+                "Capital Invertido": f"{capital:.2f}€",
+                "Valor Actual": f"{valor_actual:.2f}€",
+                "P&L": f"{pnl_valor:+.2f}€ ({pnl_pct:+.2f}%)"
             })
-        st.dataframe(pd.DataFrame(datos_pos), use_container_width=True)
+
+        df_pos = pd.DataFrame(datos_pos)
+        st.dataframe(df_pos, use_container_width=True)
+
+        # Totales
+        total_invertido = sum(p["capital"] for p in cartera["posiciones"].values())
+        total_actual = sum(p.get("precio_actual", p["precio_entrada"]) * p.get("cantidad", 0) 
+                         for p in cartera["posiciones"].values())
+        total_pnl = total_actual - total_invertido
+
+        col_t1, col_t2, col_t3 = st.columns(3)
+        col_t1.metric("Total Invertido", f"{total_invertido:.2f}€")
+        col_t2.metric("Valor Actual", f"{total_actual:.2f}€")
+        col_t3.metric("P&L Total", f"{total_pnl:+.2f}€", delta=f"{total_pnl/total_invertido*100:+.2f}%" if total_invertido > 0 else "0%")
     else:
         st.info("Cartera vacía. Ejecuta el análisis para empezar.")
 
+    # Historial de operaciones
+    if cartera["historial"]:
+        st.write("---")
+        st.write("### 📜 Historial de Operaciones")
+        df_hist = pd.DataFrame(cartera["historial"][-20:])  # Últimas 20
+        st.dataframe(df_hist, use_container_width=True)
+
     # Panel de persistencia
     with st.expander("💾 Estado de Persistencia"):
-        col_p1, col_p2 = st.columns(2)
+        col_p1, col_p2, col_p3 = st.columns(3)
         with col_p1:
             st.write(f"**Principal:** {'✅' if os.path.exists(DB_FILE) else '❌'}")
             st.write(f"**Backup:** {'✅' if os.path.exists(DB_BACKUP) else '❌'}")
@@ -482,6 +620,14 @@ with pestaña1:
             if st.button("🔄 Forzar Guardado"):
                 guardar_cartera(cartera)
                 st.success("✅ Cartera guardada")
+        with col_p3:
+            if st.button("📥 Exportar CSV"):
+                if cartera["posiciones"]:
+                    df_export = pd.DataFrame(cartera["posiciones"]).T
+                    csv = df_export.to_csv()
+                    st.download_button("Descargar", csv, "eurobot_cartera.csv", "text/csv")
+                else:
+                    st.warning("Cartera vacía")
 
 # ============================================================================
 # PESTAÑA 2: ANALISIS DE UNIVERSO
