@@ -1,43 +1,70 @@
 import streamlit as st
+import yfinance as yf
 import json
 import os
+import datetime
 
-# Nombre del archivo de persistencia
-DB_FILE = "cartera.json"
+DB_FILE = 'datos_eurobot.json'
 
-# Cargar o inicializar la cartera
-def cargar_cartera():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    else:
-        return {"balance": 50000.0, "posiciones": [], "historial": []}
+# --- Funciones de Gestión de Datos ---
+def cargar_datos():
+    if not os.path.exists(DB_FILE):
+        return {"balance": 50000.0, "acciones": 0, "historial": []}
+    with open(DB_FILE, 'r') as f:
+        return json.load(f)
 
-def guardar_cartera(cartera):
-    with open(DB_FILE, "w") as f:
-        json.dump(cartera, f, indent=4)
+def guardar_datos(datos):
+    with open(DB_FILE, 'w') as f:
+        json.dump(datos, f)
 
-cartera = cargar_cartera()
+# --- Lógica de Mercado ---
+def obtener_mercado(ticker):
+    df = yf.download(ticker, period="3mo", interval="1d")
+    df['SMA10'] = df['Close'].rolling(window=10).mean()
+    df['SMA50'] = df['Close'].rolling(window=50).mean()
+    return df
 
-st.title("🇪🇺 Eurobot: Simulador de Inversión")
+def mercado_abierto():
+    ahora = datetime.datetime.now()
+    # Mercado europeo: Lunes a Viernes, 09:00 a 17:30
+    es_dia_laboral = ahora.weekday() < 5
+    esta_en_horario = (9 <= ahora.hour < 17) or (ahora.hour == 17 and ahora.minute <= 30)
+    return es_dia_laboral and esta_en_horario
 
-# Sidebar de control
-st.sidebar.header("Panel de Control")
-st.sidebar.metric("Balance Virtual", f"{cartera['balance']:.2f} €")
+# --- Interfaz y Ejecución ---
+st.set_page_config(page_title="Eurobot Autónomo", layout="wide")
+st.title("🇪🇺 Eurobot: Modo Autónomo (Especulación)")
 
-# Interfaz de Simulación
-st.subheader("Estado de la Cartera")
-if cartera["posiciones"]:
-    st.write(cartera["posiciones"])
-else:
-    st.info("No hay posiciones abiertas actualmente.")
+datos = cargar_datos()
+caladero = st.sidebar.selectbox("Seleccionar Índice", ["^STOXX50E", "^GDAXI", "^IBEX"])
+df = obtener_mercado(caladero)
+precio_actual = float(df['Close'].iloc[-1])
 
-if st.button("Simular Compra Semanal (2.000€)"):
-    if cartera["balance"] >= 2000:
-        cartera["balance"] -= 2000
-        cartera["posiciones"].append({"ticker": "SAP.DE", "inversion": 2000, "fecha": "2026-06-07"})
-        guardar_cartera(cartera)
-        st.success("Compra simulada ejecutada con éxito.")
+st.metric("Precio Actual", f"{precio_actual:.2f} €")
+st.metric("Balance", f"{datos['balance']:,.2f} €")
+st.metric("Acciones en Cartera", datos['acciones'])
+
+if mercado_abierto():
+    st.success("Mercado ABIERTO. Bot monitoreando tendencias.")
+    
+    # Lógica de compra (Cruce alcista)
+    if df['SMA10'].iloc[-1] > df['SMA50'].iloc[-1] and datos['acciones'] == 0:
+        cantidad = int(datos['balance'] // precio_actual)
+        if cantidad > 0:
+            datos['balance'] -= (cantidad * precio_actual)
+            datos['acciones'] = cantidad
+            datos['historial'].append({"evento": "COMPRA", "precio": precio_actual, "cantidad": cantidad})
+            guardar_datos(datos)
+            st.rerun()
+
+    # Lógica de venta (Cruce bajista)
+    elif df['SMA10'].iloc[-1] < df['SMA50'].iloc[-1] and datos['acciones'] > 0:
+        datos['balance'] += (datos['acciones'] * precio_actual)
+        datos['historial'].append({"evento": "VENTA", "precio": precio_actual, "cantidad": datos['acciones']})
+        datos['acciones'] = 0
+        guardar_datos(datos)
         st.rerun()
-    else:
-        st.error("Balance insuficiente para esta operación.")
+else:
+    st.warning("Mercado CERRADO. Esperando apertura (09:00 - 17:30).")
+
+st.line_chart(df[['Close', 'SMA10', 'SMA50']])
