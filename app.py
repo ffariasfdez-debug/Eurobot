@@ -3,552 +3,425 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import json
 import os
 from datetime import datetime, timedelta
-import time
 
 # ============================================================================
-# CONFIGURACION EUROBOT
+# CONFIGURACION
 # ============================================================================
-DB_FILE = 'eurobot_cartera.json'
-DB_BACKUP = 'eurobot_cartera.json.bak'
-HISTORIAL_FILE = 'eurobot_historial.json'
-
-CAPITAL_TOTAL = 30000.0
-MAX_POR_ACCION = 2000.0
+DB_FILE = 'eurobot_datos.json'
+CAPITAL_TOTAL = 30000
 MAX_POSICIONES = 10
-COMPRAS_SEMANALES_MAX = 2
-STOP_LOSS_PCT = -8.0  # -8%
+MAX_POR_COMPRA = 2000
+MAX_COMPRAS_SEMANA = 2
 
-# Horario Europa: Lunes-Viernes 9:30-17:30 CET
-HORA_APERTURA_CET = 9
-HORA_CIERRE_CET = 17
-
-# ============================================================================
-# UNIVERSO DE ACCIONES EUROPEAS (solo EUR)
-# ============================================================================
-UNIVERSO_EUROPEO = {
-    "🇪🇸 IBEX 35": [
-        "ITX.MC", "SAN.MC", "BBVA.MC", "IBE.MC", "REP.MC",
-        "TEF.MC", "AMS.MC", "AENA.MC", "CLNX.MC", "FER.MC",
-        "GRF.MC", "IAG.MC", "MAP.MC", "MRL.MC", "NTGY.MC",
-        "RED.MC", "SAB.MC", "SGRE.MC", "SLR.MC", "ACS.MC"
-    ],
-    "🇪🇺 EURO STOXX 50": [
-        "ASML.AS", "SAP.DE", "MC.PA", "SIE.DE", "OR.PA",
-        "SAN.PA", "AIR.PA", "SU.PA", "AI.PA", "BNP.PA",
-        "DG.PA", "EL.PA", "ENEL.MI", "ENI.MI", "ISP.MI",
-        "MBG.DE", "MUV2.DE", "RMS.PA", "SAF.PA", "SCHN.PA"
-    ],
-    "🇩🇪 DAX 40 (EUR)": [
-        "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "ADS.DE",
-        "AIR.DE", "BAS.DE", "BAYN.DE", "BEI.DE", "BMW.DE",
-        "CBK.DE", "CON.DE", "1COV.DE", "DBK.DE", "DB1.DE",
-        "DPW.DE", "DRI.DE", "EVK.DE", "FME.DE", "FRE.DE",
-        "HEI.DE", "HEN3.DE", "IFX.DE", "LIN.DE", "MRK.DE",
-        "MTX.DE", "MUV2.DE", "RWE.DE", "SAP.DE", "SRT3.DE",
-        "SY1.DE", "VNA.DE", "VOW3.DE", "ZAL.DE"
-    ]
+CALADEROS = {
+    "DAX": "^GDAXI",
+    "EUROSTOXX50": "^STOXX50E",
+    "IBEX35": "^IBEX"
 }
 
-# Eliminar duplicados y mantener orden
-TODOS_TICKERS = []
-for lista in UNIVERSO_EUROPEO.values():
-    for t in lista:
-        if t not in TODOS_TICKERS:
-            TODOS_TICKERS.append(t)
-
 # ============================================================================
-# PERSISTENCIA (con backup .bak)
+# PERSISTENCIA
 # ============================================================================
-def _guardar_con_backup(data, filepath, backup_path):
+def cargar_datos():
+    if not os.path.exists(DB_FILE):
+        return {
+            "capital_disponible": CAPITAL_TOTAL,
+            "posiciones": {},  # {ticker: {"precio": x, "cantidad": y, "fecha": z, "invertido": w}}
+            "historial": [],
+            "compras_semana": {},  # {"2024-W23": 2}
+            "ultima_ejecucion": None
+        }
     try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r') as f_orig:
-                contenido = f_orig.read()
-            with open(backup_path, 'w') as f_bak:
-                f_bak.write(contenido)
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        st.error(f"Error guardando {filepath}: {e}")
-        return False
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {
+            "capital_disponible": CAPITAL_TOTAL,
+            "posiciones": {},
+            "historial": [],
+            "compras_semana": {},
+            "ultima_ejecucion": None
+        }
 
-def cargar_cartera():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    if os.path.exists(DB_BACKUP):
-        try:
-            with open(DB_BACKUP, 'r') as f:
-                data = json.load(f)
-            st.success("✅ Cartera recuperada desde backup")
-            return data
-        except:
-            pass
-    return {
-        "capital_total": CAPITAL_TOTAL,
-        "capital_disponible": CAPITAL_TOTAL,
-        "posiciones": {},
-        "historial": [],
-        "compras_esta_semana": 0,
-        "semana_actual": datetime.now().strftime("%Y-W%U")
+def guardar_datos(datos):
+    datos["ultima_ejecucion"] = datetime.now().strftime('%d/%m/%Y %H:%M')
+    with open(DB_FILE, 'w') as f:
+        json.dump(datos, f, indent=2)
+
+# ============================================================================
+# FUNCIONES DE MERCADO
+# ============================================================================
+def get_semana_actual():
+    return datetime.now().strftime("%Y-W%U")
+
+def compras_esta_semana(datos):
+    semana = get_semana_actual()
+    return datos["compras_semana"].get(semana, 0)
+
+def puede_comprar(datos):
+    semana = get_semana_actual()
+    compras = datos["compras_semana"].get(semana, 0)
+    if compras >= MAX_COMPRAS_SEMANA:
+        return False, f"Límite semanal alcanzado: {compras}/{MAX_COMPRAS_SEMANA}"
+    if len(datos["posiciones"]) >= MAX_POSICIONES:
+        return False, f"Cartera llena: {len(datos['posiciones'])}/{MAX_POSICIONES}"
+    if datos["capital_disponible"] < MAX_POR_COMPRA:
+        return False, f"Capital insuficiente: {datos['capital_disponible']:.0f}€"
+    return True, "OK"
+
+def registrar_compra(datos, ticker, precio, cantidad, invertido):
+    semana = get_semana_actual()
+    datos["compras_semana"][semana] = datos["compras_semana"].get(semana, 0) + 1
+    datos["posiciones"][ticker] = {
+        "precio": round(precio, 2),
+        "cantidad": round(cantidad, 4),
+        "fecha": datetime.now().strftime('%d/%m/%Y'),
+        "invertido": round(invertido, 2),
+        "mercado": [k for k, v in CALADEROS.items() if v == ticker][0]
     }
+    datos["capital_disponible"] -= invertido
+    datos["historial"].append(f"✅ COMPRA: {ticker} @ {precio:.2f}€ | {cantidad:.4f} uds | {invertido:.0f}€ | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    guardar_datos(datos)
 
-def guardar_cartera(data):
-    _guardar_con_backup(data, DB_FILE, DB_BACKUP)
+def registrar_venta(datos, ticker, precio_actual, motivo="Tendencia rota"):
+    if ticker in datos["posiciones"]:
+        pos = datos["posiciones"][ticker]
+        valor_actual = pos["cantidad"] * precio_actual
+        pnl = valor_actual - pos["invertido"]
+        pnl_pct = (pnl / pos["invertido"]) * 100 if pos["invertido"] > 0 else 0
 
-def cargar_historial():
-    if os.path.exists(HISTORIAL_FILE):
-        try:
-            with open(HISTORIAL_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return []
+        datos["capital_disponible"] += valor_actual
+        del datos["posiciones"][ticker]
 
-def guardar_historial(historial):
-    with open(HISTORIAL_FILE, 'w') as f:
-        json.dump(historial, f, indent=2)
+        emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⬜"
+        datos["historial"].append(
+            f"{emoji} VENTA: {ticker} @ {precio_actual:.2f}€ | P&L: {pnl:+.2f}€ ({pnl_pct:+.1f}%) | {motivo} | {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        )
+        guardar_datos(datos)
+        return True, pnl
+    return False, 0
 
 # ============================================================================
-# FUNCIONES DE ANALISIS
+# ANALISIS TECNICO
 # ============================================================================
-def descargar_datos_batch(tickers, period="3mo"):
-    """Descarga datos batch para todos los tickers."""
+def analizar_tendencia(ticker):
     try:
-        datos = yf.download(" ".join(tickers), period=period, interval="1d", 
-                           group_by="ticker", progress=False)
-        return datos
-    except:
-        return pd.DataFrame()
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if df.empty or len(df) < 50:
+            return None, "Sin datos"
 
-def extraer_historial(datos_globales, ticker):
-    """Extrae historial de un ticker específico del batch."""
-    try:
-        if not datos_globales.empty:
-            if ticker in datos_globales.columns.get_level_values(0):
-                h = datos_globales[ticker].dropna()
-                if not h.empty:
-                    return h
-    except:
-        pass
-    try:
-        return yf.Ticker(ticker).history(period="3mo", interval="1d")
-    except:
-        return pd.DataFrame()
+        sma10 = df['Close'].rolling(window=10).mean().iloc[-1]
+        sma50 = df['Close'].rolling(window=50).mean().iloc[-1]
+        precio_actual = df['Close'].iloc[-1]
 
-def calcular_metricas(historial, precio_actual, ticker):
-    """Calcula métricas para scoring."""
-    if historial.empty or len(historial) < 50:
-        return None
+        # Calcular RSI
+        delta = df['Close'].diff()
+        ganancia = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        perdida = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = ganancia / perdida
+        rsi = 100 - (100 / (1 + rs))
+        rsi_valor = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
 
-    try:
-        # Tendencia: SMA10 vs SMA50
-        sma10 = historial["Close"].iloc[-10:].mean()
-        sma50 = historial["Close"].iloc[-50:].mean()
-        tendencia_alcista = precio_actual > sma10 > sma50
-
-        # Momentum 60d
-        precio_60d = historial["Close"].iloc[-60] if len(historial) >= 60 else historial["Close"].iloc[0]
-        if precio_60d > 0:
-            momentum = ((precio_actual / precio_60d) ** (252/60) - 1) * 100
-            momentum = round(momentum, 1)
-            # Limitar momentum anómalo (>200% probablemente split/gap)
-            if momentum > 200 or momentum < -80:
-                precio_media_20d = historial["Close"].iloc[-20:].mean()
-                if precio_media_20d > 0:
-                    momentum = ((precio_actual / precio_media_20d) ** (252/20) - 1) * 100
-                    momentum = round(momentum, 1)
-        else:
-            momentum = 0.0
-
-        # Upside Analista
-        upside = None
-        try:
-            info = yf.Ticker(ticker).info
-            target = info.get("targetMedianPrice", None)
-            if target and target > 0 and precio_actual > 0:
-                upside = ((target - precio_actual) / precio_actual) * 100
-                if -50 < upside < 100:
-                    upside = round(upside, 1)
-                else:
-                    upside = None
-        except:
-            pass
+        tendencia_alcista = float(sma10) > float(sma50)
+        fuerza = "FUERTE" if float(precio_actual) > float(sma10) else "DEBIL"
 
         return {
-            "tendencia_alcista": tendencia_alcista,
-            "sma10": sma10,
-            "sma50": sma50,
-            "momentum": momentum,
-            "upside": upside,
-            "precio": precio_actual
-        }
-    except:
-        return None
+            "precio": round(float(precio_actual), 2),
+            "sma10": round(float(sma10), 2),
+            "sma50": round(float(sma50), 2),
+            "tendencia": tendencia_alcista,
+            "fuerza": fuerza,
+            "rsi": round(float(rsi_valor), 1),
+            "nombre": [k for k, v in CALADEROS.items() if v == ticker][0]
+        }, "OK"
+    except Exception as e:
+        return None, str(e)
 
-def calcular_score(metricas):
-    """Scoring sobre 10 puntos."""
-    if not metricas:
-        return 0
-
+def calcular_score_eurobot(analisis):
     score = 0
     motivos = []
 
-    # Tendencia (40% del peso)
-    if metricas["tendencia_alcista"]:
-        score += 4
-        motivos.append("Tendencia alcista (+4)")
-    else:
-        motivos.append("Sin tendencia alcista")
+    if analisis["tendencia"]:
+        score += 5
+        motivos.append("Tendencia alcista SMA10>SMA50 (+5)")
 
-    # Momentum 60d (30%)
-    m = metricas["momentum"]
-    if m >= 20:
+    if analisis["fuerza"] == "FUERTE":
         score += 3
-        motivos.append(f"Momentum fuerte {m:.1f}% (+3)")
-    elif m >= 10:
-        score += 2
-        motivos.append(f"Momentum moderado {m:.1f}% (+2)")
-    elif m > 0:
-        score += 1
-        motivos.append(f"Momentum positivo {m:.1f}% (+1)")
+        motivos.append("Precio > SMA10 (+3)")
     else:
-        motivos.append(f"Momentum negativo {m:.1f}%")
+        motivos.append("Precio < SMA10 (0)")
 
-    # Upside Analista (30%)
-    u = metricas["upside"]
-    if u is not None and u > 20:
-        score += 3
-        motivos.append(f"Upside fuerte {u:.1f}% (+3)")
-    elif u is not None and u > 10:
+    if 30 < analisis["rsi"] < 70:
         score += 2
-        motivos.append(f"Upside moderado {u:.1f}% (+2)")
-    elif u is not None and u > 0:
+        motivos.append(f"RSI {analisis['rsi']:.0f} en zona neutral (+2)")
+    elif analisis["rsi"] < 30:
         score += 1
-        motivos.append(f"Upside positivo {u:.1f}% (+1)")
+        motivos.append(f"RSI {analisis['rsi']:.0f} sobreventa (+1)")
     else:
-        motivos.append("Sin upside confirmado")
+        motivos.append(f"RSI {analisis['rsi']:.0f} sobrecompra (0)")
 
-    # Penalizacion: si no hay tendencia alcista, maximo 5
-    if not metricas["tendencia_alcista"] and score > 5:
-        score = 5
-        motivos.append("Score limitado a 5 sin tendencia alcista")
-
-    return max(0, score), motivos
+    return score, motivos
 
 # ============================================================================
-# LOGICA DE COMPRA/VENTA
+# LOGICA AUTONOMA
 # ============================================================================
-def puede_comprar_esta_semana(cartera):
-    """Verifica si se pueden hacer compras esta semana."""
-    semana_actual = datetime.now().strftime("%Y-W%U")
-    if cartera.get("semana_actual") != semana_actual:
-        cartera["semana_actual"] = semana_actual
-        cartera["compras_esta_semana"] = 0
-        return True, 0
-    return cartera["compras_esta_semana"] < COMPRAS_SEMANALES_MAX, cartera["compras_esta_semana"]
+def ejecutar_logica_autonoma(datos):
+    acciones = []
 
-def evaluar_posiciones(cartera, datos_activos):
-    """Evalua posiciones actuales: stop-loss, tendencia rota, ranking."""
-    alertas = []
-    posiciones = cartera.get("posiciones", {})
+    # 1. Analizar todos los caladeros
+    analisis_mercado = {}
+    for nombre, ticker in CALADEROS.items():
+        analisis, error = analizar_tendencia(ticker)
+        if analisis:
+            analisis_mercado[ticker] = analisis
+        else:
+            acciones.append(f"⚠️ {nombre}: Error - {error}")
 
-    for ticker, pos in posiciones.items():
-        precio_entrada = pos["precio_entrada"]
-        precio_actual = pos.get("precio_actual", precio_entrada)
+    if not analisis_mercado:
+        return acciones + ["❌ No se pudo analizar ningún mercado"]
 
-        # 1. Stop-loss
-        cambio_pct = ((precio_actual - precio_entrada) / precio_entrada) * 100
-        if cambio_pct <= STOP_LOSS_PCT:
-            alertas.append({
-                "ticker": ticker,
-                "tipo": "STOP_LOSS",
-                "motivo": f"Caida {cambio_pct:.1f}% <= {STOP_LOSS_PCT}%",
-                "precio_entrada": precio_entrada,
-                "precio_actual": precio_actual
-            })
+    # 2. VENDER posiciones que ya no son alcistas
+    for ticker in list(datos["posiciones"].keys()):
+        if ticker in analisis_mercado:
+            if not analisis_mercado[ticker]["tendencia"]:
+                ok, pnl = registrar_venta(datos, ticker, analisis_mercado[ticker]["precio"], "Tendencia rota")
+                if ok:
+                    acciones.append(f"🗑️ VENDIDO {ticker}: Tendencia rota | P&L: {pnl:+.2f}€")
+
+    # 3. Calcular scores y ordenar
+    scores = {}
+    for ticker, analisis in analisis_mercado.items():
+        score, motivos = calcular_score_eurobot(analisis)
+        scores[ticker] = {"score": score, "motivos": motivos, "analisis": analisis}
+
+    # Ordenar por score descendente
+    tickers_ordenados = sorted(scores.keys(), key=lambda x: scores[x]["score"], reverse=True)
+
+    # 4. COMPRAR las mejores oportunidades
+    for ticker in tickers_ordenados:
+        if ticker in datos["posiciones"]:
+            continue  # Ya tenemos esta posición
+
+        if not scores[ticker]["analisis"]["tendencia"]:
+            continue  # No es alcista
+
+        if scores[ticker]["score"] < 5:
+            continue  # Score insuficiente
+
+        puede, msg = puede_comprar(datos)
+        if not puede:
+            acciones.append(f"⏳ {ticker}: {msg}")
             continue
 
-        # 2. Tendencia rota
-        info = datos_activos.get(ticker)
-        if info and not info.get("tendencia_alcista", True):
-            alertas.append({
-                "ticker": ticker,
-                "tipo": "TENDENCIA_ROTA",
-                "motivo": "SMA10 < SMA50, tendencia invertida",
-                "precio_entrada": precio_entrada,
-                "precio_actual": precio_actual
-            })
+        precio = scores[ticker]["analisis"]["precio"]
+        cantidad = MAX_POR_COMPRA / precio
+        invertido = MAX_POR_COMPRA
 
-    return alertas
+        registrar_compra(datos, ticker, precio, cantidad, invertido)
+        acciones.append(f"💰 COMPRADO {ticker}: Score {scores[ticker]['score']}/10 | {invertido:.0f}€ @ {precio:.2f}€")
+
+    return acciones
 
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
-st.set_page_config(page_title="🇪🇺 Eurobot", layout="wide")
-st.title("🇪🇺 Eurobot: Pescador Autónomo Europeo")
-st.write(f"**Capital:** {CAPITAL_TOTAL:,.0f}€ | **Máx/posición:** {MAX_POR_ACCION:,.0f}€ | **Máx posiciones:** {MAX_POSICIONES} | **Stop-loss:** {STOP_LOSS_PCT}%")
-st.write(f"**Fecha:** {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+st.set_page_config(page_title="🇪🇺 Eurobot Autónomo", layout="wide")
+
+st.title("🇪🇺 Eurobot Autónomo")
+st.write(f"**Capital:** {CAPITAL_TOTAL:,.0f}€ | **Máx:** {MAX_POSICIONES} pos | **Compra:** {MAX_POR_COMPRA:,.0f}€ | **Semana:** {MAX_COMPRAS_SEMANA} compras")
+st.write(f"**Caladeros:** DAX, EuroStoxx 50, IBEX 35")
 st.write("---")
 
 # Cargar datos
-cartera = cargar_cartera()
+datos = cargar_datos()
 
-# Verificar reset semanal
-semana_actual = datetime.now().strftime("%Y-W%U")
-if cartera.get("semana_actual") != semana_actual:
-    cartera["semana_actual"] = semana_actual
-    cartera["compras_esta_semana"] = 0
-    guardar_cartera(cartera)
+# Ejecutar lógica autónoma
+with st.spinner("🤖 Eurobot analizando mercados..."):
+    acciones = ejecutar_logica_autonoma(datos)
 
-# ============================================================================
-# PESTANAS
-# ============================================================================
-pestaña1, pestaña2, pestaña3 = st.tabs([
-    "🤖 Bot Autónomo",
-    "📊 Análisis de Universo", 
-    "⚙️ Configuración"
-])
+# Recargar datos después de la ejecución
+datos = cargar_datos()
 
-# ============================================================================
-# PESTAÑA 1: BOT AUTONOMO
-# ============================================================================
-with pestaña1:
-    st.subheader("🤖 Estado del Bot")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Capital Total", f"{cartera['capital_total']:,.0f}€")
-    col2.metric("Capital Disponible", f"{cartera['capital_disponible']:,.0f}€")
-    col3.metric("Posiciones", f"{len(cartera['posiciones'])}/{MAX_POSICIONES}")
-    col4.metric("Compras Semana", f"{cartera['compras_esta_semana']}/{COMPRAS_SEMANALES_MAX}")
-
+# Mostrar acciones del bot
+if acciones:
+    st.write("### 📝 Acciones Autónomas del Bot")
+    for accion in acciones:
+        st.write(accion)
     st.write("---")
 
-    # Botón ejecutar análisis
-    if st.button("🔄 Ejecutar Análisis Completo", type="primary"):
-        with st.spinner("Descargando datos de mercado..."):
-            datos_batch = descargar_datos_batch(TODOS_TICKERS, period="3mo")
+# METRICAS PRINCIPALES
+col1, col2, col3, col4, col5 = st.columns(5)
+invertido = sum(p["invertido"] for p in datos["posiciones"].values())
+capital_disponible = datos["capital_disponible"]
 
-        if datos_batch.empty:
-            st.error("❌ No se pudieron descargar datos")
-        else:
-            resultados = []
-            barra = st.progress(0)
+pnl_total = 0
+for ticker, pos in datos["posiciones"].items():
+    try:
+        df = yf.download(ticker, period="1d", interval="1m", progress=False)
+        if not df.empty:
+            precio_actual = float(df['Close'].iloc[-1])
+            valor_actual = pos["cantidad"] * precio_actual
+            pnl_total += valor_actual - pos["invertido"]
+    except:
+        pass
 
-            for i, ticker in enumerate(TODOS_TICKERS):
-                barra.progress(int((i / len(TODOS_TICKERS)) * 100))
-                try:
-                    h = extraer_historial(datos_batch, ticker)
-                    if h.empty or len(h) < 50:
-                        continue
+col1.metric("Capital Total", f"{CAPITAL_TOTAL:,.0f}€")
+col2.metric("Invertido", f"{invertido:,.0f}€")
+col3.metric("Disponible", f"{capital_disponible:,.0f}€")
+col4.metric("P&L Total", f"{pnl_total:+.2f}€", delta=f"{pnl_total/CAPITAL_TOTAL*100:+.1f}%")
+col5.metric("Posiciones", f"{len(datos['posiciones'])}/{MAX_POSICIONES}")
 
-                    precio = h["Close"].iloc[-1]
-                    if pd.isna(precio) or precio <= 0:
-                        continue
-
-                    metricas = calcular_metricas(h, precio, ticker)
-                    if not metricas:
-                        continue
-
-                    score, motivos = calcular_score(metricas)
-
-                    resultados.append({
-                        "Ticker": ticker,
-                        "Score": score,
-                        "Precio": f"{precio:.2f}€",
-                        "Tendencia": "✅ Alcista" if metricas["tendencia_alcista"] else "❌ Bajista",
-                        "Momentum": f"{metricas['momentum']:.1f}%",
-                        "Upside": f"{metricas['upside']:.1f}%" if metricas['upside'] else "N/A",
-                        "SMA10": f"{metricas['sma10']:.2f}",
-                        "SMA50": f"{metricas['sma50']:.2f}",
-                        "Motivos": " | ".join(motivos)
-                    })
-                except:
-                    pass
-
-            barra.empty()
-
-            if resultados:
-                df_resultados = pd.DataFrame(resultados)
-                df_resultados = df_resultados.sort_values("Score", ascending=False)
-
-                st.write("### 🏆 Ranking del Universo")
-                st.dataframe(df_resultados, use_container_width=True)
-
-                # Identificar top 10
-                top10 = df_resultados.head(10)
-                st.write("### 🎯 Top 10 Oportunidades")
-                st.dataframe(top10[["Ticker", "Score", "Precio", "Tendencia", "Momentum", "Upside"]], 
-                           use_container_width=True)
-
-                # Evaluar posiciones actuales
-                if cartera["posiciones"]:
-                    st.write("---")
-                    st.write("### 🚨 Evaluación de Posiciones Actuales")
-
-                    datos_activos = {}
-                    for _, row in df_resultados.iterrows():
-                        datos_activos[row["Ticker"]] = {
-                            "tendencia_alcista": "✅" in row["Tendencia"],
-                            "score": row["Score"]
-                        }
-
-                    alertas = evaluar_posiciones(cartera, datos_activos)
-
-                    if alertas:
-                        for alerta in alertas:
-                            if alerta["tipo"] == "STOP_LOSS":
-                                st.error(f"🛑 {alerta['ticker']}: {alerta['motivo']} | "
-                                        f"Entrada: {alerta['precio_entrada']:.2f}€ | "
-                                        f"Actual: {alerta['precio_actual']:.2f}€")
-                            elif alerta["tipo"] == "TENDENCIA_ROTA":
-                                st.warning(f"⚠️ {alerta['ticker']}: {alerta['motivo']} | "
-                                          f"Entrada: {alerta['precio_entrada']:.2f}€ | "
-                                          f"Actual: {alerta['precio_actual']:.2f}€")
-                    else:
-                        st.success("✅ Todas las posiciones están dentro de parámetros")
-
-                # Propuestas de compra
-                st.write("---")
-                st.write("### 💰 Propuestas de Compra")
-
-                puede_comprar, compras_hechas = puede_comprar_esta_semana(cartera)
-                posiciones_actuales = set(cartera["posiciones"].keys())
-
-                if not puede_comprar:
-                    st.info(f"⏳ Limite de compras semanal alcanzado: {compras_hechas}/{COMPRAS_SEMANALES_MAX}")
-                elif len(cartera["posiciones"]) >= MAX_POSICIONES:
-                    st.info(f"📊 Cartera llena: {len(cartera['posiciones'])}/{MAX_POSICIONES} posiciones")
-
-                    # Sugerir sustitución
-                    top_no_en_cartera = [t for t in top10["Ticker"].tolist() 
-                                        if t not in posiciones_actuales][:COMPRAS_SEMANALES_MAX]
-
-                    if top_no_en_cartera:
-                        st.write("**Sustituciones sugeridas:**")
-                        for nuevo in top_no_en_cartera:
-                            # Encontrar la peor posición actual
-                            peor = min(cartera["posiciones"].items(), 
-                                      key=lambda x: datos_activos.get(x[0], {}).get("score", 0))
-                            st.write(f"🔄 Vender {peor[0]} → Comprar {nuevo}")
-                else:
-                    # Compras directas
-                    top_no_en_cartera = [t for t in top10["Ticker"].tolist() 
-                                        if t not in posiciones_actuales][:COMPRAS_SEMANALES_MAX]
-
-                    if top_no_en_cartera:
-                        st.write(f"**Compras recomendadas (max {COMPRAS_SEMANALES_MAX} esta semana):**")
-                        for ticker in top_no_en_cartera:
-                            row = df_resultados[df_resultados["Ticker"] == ticker].iloc[0]
-                            st.success(f"🟢 {ticker}: Score {row['Score']}/10 | {row['Precio']} | "
-                                      f"Momentum: {row['Momentum']} | Upside: {row['Upside']}")
-                    else:
-                        st.info("Todas las top oportunidades ya están en cartera")
+# ESTADO DE LOS CALADEROS
+st.write("### 📊 Estado de los Caladeros")
+for nombre, ticker in CALADEROS.items():
+    analisis, error = analizar_tendencia(ticker)
+    if analisis:
+        col_info, col_precio, col_tendencia, col_score = st.columns([2, 1, 2, 1])
+        with col_info:
+            st.write(f"**{nombre}** ({ticker})")
+        with col_precio:
+            st.write(f"{analisis['precio']:.2f}€")
+        with col_tendencia:
+            if analisis["tendencia"]:
+                st.success(f"🟢 Alcista | SMA10: {analisis['sma10']:.0f} | SMA50: {analisis['sma50']:.0f}")
             else:
-                st.warning("No se pudieron analizar activos")
-
-    # Mostrar cartera actual
-    st.write("---")
-    st.write("### 📁 Cartera Actual")
-
-    if cartera["posiciones"]:
-        datos_pos = []
-        for ticker, pos in cartera["posiciones"].items():
-            datos_pos.append({
-                "Ticker": ticker,
-                "Precio Entrada": f"{pos['precio_entrada']:.2f}€",
-                "Cantidad": pos.get("cantidad", 0),
-                "Capital": f"{pos.get('capital', 0):.2f}€",
-                "Fecha": pos.get("fecha", "N/A")
-            })
-        st.dataframe(pd.DataFrame(datos_pos), use_container_width=True)
+                st.error(f"🔴 Bajista | SMA10: {analisis['sma10']:.0f} | SMA50: {analisis['sma50']:.0f}")
+        with col_score:
+            score, _ = calcular_score_eurobot(analisis)
+            st.write(f"Score: {score}/10")
     else:
-        st.info("Cartera vacía. Ejecuta el análisis para empezar.")
+        st.error(f"❌ {nombre}: {error}")
 
-    # Panel de persistencia
-    with st.expander("💾 Estado de Persistencia"):
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            st.write(f"**Principal:** {'✅' if os.path.exists(DB_FILE) else '❌'}")
-            st.write(f"**Backup:** {'✅' if os.path.exists(DB_BACKUP) else '❌'}")
-        with col_p2:
-            if st.button("🔄 Forzar Guardado"):
-                guardar_cartera(cartera)
-                st.success("✅ Cartera guardada")
+# CARTERA ACTUAL
+st.write("---")
+st.write(f"### 📈 Cartera ({len(datos['posiciones'])}/{MAX_POSICIONES} posiciones)")
 
-# ============================================================================
-# PESTAÑA 2: ANALISIS DE UNIVERSO
-# ============================================================================
-with pestaña2:
-    st.subheader("📊 Análisis Individual")
+if datos["posiciones"]:
+    cartera_data = []
+    for ticker, pos in datos["posiciones"].items():
+        try:
+            # Descargar datos para calcular rentabilidad del día
+            df_hoy = yf.download(ticker, period="2d", interval="1d", progress=False)
+            df_1min = yf.download(ticker, period="1d", interval="1m", progress=False)
 
-    ticker_input = st.text_input("Ticker europeo:", placeholder="Ej: SAP.DE, ASML.AS, ITX.MC...")
+            if not df_hoy.empty and len(df_hoy) >= 2:
+                precio_cierre_ayer = float(df_hoy['Close'].iloc[-2])
+                precio_apertura_hoy = float(df_hoy['Open'].iloc[-1])
+                precio_actual = float(df_hoy['Close'].iloc[-1])
 
-    if st.button("🔍 Analizar") and ticker_input.strip():
-        ticker = ticker_input.strip().upper()
-        with st.spinner(f"Analizando {ticker}..."):
+                # Si tenemos datos intradía más recientes, usarlos
+                if not df_1min.empty:
+                    precio_actual = float(df_1min['Close'].iloc[-1])
+            else:
+                precio_cierre_ayer = pos["precio"]
+                precio_apertura_hoy = pos["precio"]
+                precio_actual = pos["precio"]
+
+            # Rentabilidad del día (desde apertura)
+            rend_dia_pct = ((precio_actual - precio_apertura_hoy) / precio_apertura_hoy) * 100 if precio_apertura_hoy > 0 else 0
+            rend_dia_eur = pos["cantidad"] * (precio_actual - precio_apertura_hoy)
+
+            # Rentabilidad acumulada (desde compra)
+            rend_acum_pct = ((precio_actual - pos["precio"]) / pos["precio"]) * 100 if pos["precio"] > 0 else 0
+            rend_acum_eur = pos["cantidad"] * (precio_actual - pos["precio"])
+
+            # Stop Loss y Take Profit (basado en ATR o volatilidad)
             try:
-                h = yf.Ticker(ticker).history(period="3mo", interval="1d")
-                if h.empty or len(h) < 50:
-                    st.error("Datos insuficientes")
+                df_atr = yf.download(ticker, period="1mo", interval="1d", progress=False)
+                if not df_atr.empty and len(df_atr) >= 14:
+                    high_low = df_atr['High'] - df_atr['Low']
+                    high_close = abs(df_atr['High'] - df_atr['Close'].shift())
+                    low_close = abs(df_atr['Low'] - df_atr['Close'].shift())
+                    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                    atr = tr.rolling(window=14).mean().iloc[-1]
+
+                    stop_loss = pos["precio"] - (atr * 2)  # 2x ATR debajo
+                    take_profit = pos["precio"] + (atr * 3)  # 3x ATR arriba
                 else:
-                    precio = h["Close"].iloc[-1]
-                    metricas = calcular_metricas(h, precio, ticker)
-                    score, motivos = calcular_score(metricas)
+                    stop_loss = pos["precio"] * 0.95  # -5%
+                    take_profit = pos["precio"] * 1.15  # +15%
+            except:
+                stop_loss = pos["precio"] * 0.95
+                take_profit = pos["precio"] * 1.15
 
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Precio", f"{precio:.2f}€")
-                    c2.metric("Score", f"{score}/10")
-                    c3.metric("Momentum", f"{metricas['momentum']:.1f}%")
+            # Color según rentabilidad
+            color_dia = "🟢" if rend_dia_pct >= 0 else "🔴"
+            color_acum = "🟢" if rend_acum_pct >= 0 else "🔴"
 
-                    c4, c5, c6 = st.columns(3)
-                    c4.metric("SMA10", f"{metricas['sma10']:.2f}")
-                    c5.metric("SMA50", f"{metricas['sma50']:.2f}")
-                    c6.metric("Upside", f"{metricas['upside']:.1f}%" if metricas['upside'] else "N/A")
+            cartera_data.append({
+                "Ticker": ticker,
+                "Nombre": pos["mercado"],
+                "Fecha Compra": pos["fecha"],
+                "Precio Entrada": f"{pos['precio']:.2f}€",
+                "Precio Actual": f"{precio_actual:.2f}€",
+                "Cantidad": f"{pos['cantidad']:.4f}",
+                "Invertido": f"{pos['invertido']:.0f}€",
+                f"Rend. Día {color_dia}": f"{rend_dia_pct:+.2f}% ({rend_dia_eur:+.2f}€)",
+                f"Rend. Acum. {color_acum}": f"{rend_acum_pct:+.2f}% ({rend_acum_eur:+.2f}€)",
+                "Stop Loss": f"{stop_loss:.2f}€",
+                "Take Profit": f"{take_profit:.2f}€",
+                "Distancia SL": f"{((precio_actual - stop_loss) / precio_actual * 100):.1f}%",
+                "Distancia TP": f"{((take_profit - precio_actual) / precio_actual * 100):.1f}%"
+            })
+        except Exception as e:
+            st.warning(f"Error cargando {ticker}: {e}")
+            cartera_data.append({
+                "Ticker": ticker,
+                "Nombre": pos["mercado"],
+                "Fecha Compra": pos["fecha"],
+                "Precio Entrada": f"{pos['precio']:.2f}€",
+                "Precio Actual": "Error",
+                "Cantidad": f"{pos['cantidad']:.4f}",
+                "Invertido": f"{pos['invertido']:.0f}€",
+                "Rend. Día": "N/A",
+                "Rend. Acum.": "N/A",
+                "Stop Loss": "N/A",
+                "Take Profit": "N/A",
+                "Distancia SL": "N/A",
+                "Distancia TP": "N/A"
+            })
 
-                    if metricas["tendencia_alcista"]:
-                        st.success("✅ Tendencia Alcista")
-                    else:
-                        st.error("❌ Tendencia Bajista")
+    df_cartera = pd.DataFrame(cartera_data)
+    st.dataframe(df_cartera, use_container_width=True)
 
-                    st.write(f"**Motivos:** {' | '.join(motivos)}")
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-# ============================================================================
-# PESTAÑA 3: CONFIGURACION
-# ============================================================================
-with pestaña3:
-    st.subheader("⚙️ Configuración y Listas")
-
-    for nombre, tickers in UNIVERSO_EUROPEO.items():
-        with st.expander(f"{nombre} ({len(tickers)} tickers)"):
-            st.write(", ".join(tickers))
+    # Resumen de rentabilidades
+    total_rend_dia = sum([float(row[f"Rend. Día {('🟢' if float(row[f'Rend. Día 🟢'].split('%')[0]) >= 0 else '🔴')}"].split('€')[0].split('(')[1]) 
+                        for row in cartera_data if "€" in row.get(f"Rend. Día 🟢", "") or "€" in row.get(f"Rend. Día 🔴", "")])
 
     st.write("---")
-    st.write(f"**Total tickers en universo:** {len(TODOS_TICKERS)}")
-    st.write(f"**Tickers únicos:** {len(set(TODOS_TICKERS))}")
+    col_r1, col_r2, col_r3 = st.columns(3)
+    with col_r1:
+        st.metric("Rentabilidad Total Acumulada", f"{sum([float(row['Rend. Acum. 🟢'].split('%')[0]) if '🟢' in row.get('Rend. Acum. 🟢', '') else float(row['Rend. Acum. 🔴'].split('%')[0]) for row in cartera_data]):+.2f}%")
+    with col_r2:
+        st.metric("Mejor Posición", max([float(row['Rend. Acum. 🟢'].split('%')[0]) if '🟢' in row.get('Rend. Acum. 🟢', '') else float(row['Rend. Acum. 🔴'].split('%')[0]) for row in cartera_data]))
+    with col_r3:
+        st.metric("Peor Posición", min([float(row['Rend. Acum. 🟢'].split('%')[0]) if '🟢' in row.get('Rend. Acum. 🟢', '') else float(row['Rend. Acum. 🔴'].split('%')[0]) for row in cartera_data]))
+else:
+    st.info("Cartera vacía. El bot comprará cuando detecte tendencias alcistas.")
+# HISTORIAL
+st.write("---")
+st.write("### 📜 Historial de Operaciones")
+if datos["historial"]:
+    for op in reversed(datos["historial"][-20:]):
+        st.write(op)
+else:
+    st.info("Sin operaciones todavía.")
 
-    if st.button("🗑️ Resetear Cartera"):
-        cartera = {
-            "capital_total": CAPITAL_TOTAL,
-            "capital_disponible": CAPITAL_TOTAL,
-            "posiciones": {},
-            "historial": [],
-            "compras_esta_semana": 0,
-            "semana_actual": datetime.now().strftime("%Y-W%U")
-        }
-        guardar_cartera(cartera)
-        st.success("Cartera reseteada")
-        st.rerun()
+# CONTROLES MANUALES (para emergencias)
+with st.expander("⚙️ Controles Manuales (Emergencia)"):
+    col_reset, col_forzar = st.columns(2)
+    with col_reset:
+        if st.button("🗑️ Resetear Todo", type="secondary"):
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
+            st.success("✅ Datos reseteados. Recarga la página.")
+            st.rerun()
+    with col_forzar:
+        if st.button("🔄 Forzar Ejecución", type="primary"):
+            st.rerun()
 
 st.write("---")
-st.caption("Eurobot v1.0 | Pescador Autónomo Europeo | Streamlit + yFinance")
+st.caption(f"🇪🇺 Eurobot Autónomo | Última ejecución: {datos.get('ultima_ejecucion', 'Nunca')} | Funciona aunque la app esté apagada (usa persistencia JSON)")
