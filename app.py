@@ -1,4 +1,5 @@
 
+
 import streamlit as st
 import pandas as pd
 import yfinance as yf
@@ -925,6 +926,182 @@ with pestaña1:
     col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([2, 1, 1, 1, 1])
     with col_btn1:
         ejecutar_bot = st.button("🔄 Ejecutar Bot")
+
+    # ============================================================================
+    # EJECUCION DEL BOT
+    # ============================================================================
+    if ejecutar_bot:
+        # Obtener tickers a analizar
+        if lista_bot == "🌍 TODAS LAS LISTAS":
+            tickers_a_analizar = []
+            for lista in st.session_state.listas_guardadas.values():
+                for t in lista:
+                    if t not in tickers_a_analizar:
+                        tickers_a_analizar.append(t)
+        else:
+            tickers_a_analizar = st.session_state.listas_guardadas.get(lista_bot, [])
+
+        if not tickers_a_analizar:
+            st.warning("No hay tickers para analizar. Selecciona una lista.")
+        else:
+            st.info(f"📊 Analizando {len(tickers_a_analizar)} activos...")
+
+            with st.spinner("🚴‍♂️ Descargando datos del mercado..."):
+                datos_globales = descargar_datos_seguro(tickers_a_analizar, period="1y", actions=True)
+
+            if datos_globales.empty:
+                st.error("❌ No se pudieron descargar datos. Intenta más tarde.")
+            else:
+                resultados = []
+                barra = st.progress(0)
+                total = len(tickers_a_analizar)
+
+                for idx, tick in enumerate(tickers_a_analizar):
+                    barra.progress(int((idx / total) * 100))
+                    try:
+                        h = extraer_historial(datos_globales, tick)
+                        if h.empty or len(h) < 50:
+                            continue
+
+                        p_actual = h["Close"].iloc[-1]
+                        if p_actual <= 0:
+                            continue
+
+                        media_50 = h["Close"].iloc[-50:].mean()
+                        media_200 = h["Close"].iloc[-200:].mean() if len(h) >= 200 else media_50
+
+                        target_val, div_yield, moneda, pct_inst, market_cap, sector, beta_info, revenue_growth = obtener_info_segura(tick)
+
+                        rsi_valor = calcular_rsi(h)
+                        beta_valor = calcular_beta(h, beta_info)
+
+                        # Motor v6.1
+                        crec_anual, upside_anal, rev_growth = calcular_metricas_limpias(h, p_actual, tick)
+                        confianza, motivo_conf = calcular_confianza_dato(crec_anual, upside_anal, rev_growth)
+                        potencial_comp = calcular_potencial_compuesto(crec_anual, upside_anal, rev_growth)
+
+                        score, status, motivos, potencial_final = calcular_score_y_status(
+                            crec_anual, upside_anal, rev_growth, rsi_valor, media_200, p_actual
+                        )
+
+                        # Evaluar caida
+                        alertas_caida_list = []
+                        try:
+                            precio_ayer = h["Close"].iloc[-2]
+                            cambio_hoy = ((p_actual - precio_ayer) / precio_ayer) * 100
+                            if cambio_hoy <= -5:
+                                score, status, motivos, alertas_caida_list = evaluar_caida_para_buyhold(
+                                    tick, h, p_actual, crec_anual, upside_anal, rev_growth,
+                                    score, status, motivos
+                                )
+                        except:
+                            pass
+
+                        # Alerta caida violenta
+                        alerta_caida = None
+                        es_peligroso, motivo_caida, severidad = detectar_caida_violenta(h, p_actual)
+                        if es_peligroso and severidad >= 2:
+                            alerta_caida = motivo_caida
+                            status = "🔴 NO COMPRAR"
+                            score = 0
+
+                        sym = simbolo_moneda(moneda)
+
+                        confianza_fmt = confianza
+                        if confianza == "BAJA":
+                            confianza_fmt = "🔴 BAJA"
+                        elif confianza == "MEDIA":
+                            confianza_fmt = "🟡 MEDIA"
+                        else:
+                            confianza_fmt = "🟢 ALTA"
+
+                        alertas_str = " | ".join(alertas_caida_list) if alertas_caida_list else ""
+
+                        resultados.append({
+                            "Ticker": tick,
+                            "Score": score,
+                            "Status": status,
+                            "Precio": f"{p_actual:.2f} {sym}",
+                            "Crecimiento Anualizado": f"{crec_anual:.1f}%",
+                            "Upside Analista": f"{upside_anal:.1f}%" if upside_anal else "N/A",
+                            "Revenue Growth": f"{rev_growth:.1f}%" if rev_growth else "N/A",
+                            "Potencial Compuesto": f"{potencial_comp:.1f}%" if potencial_comp else "N/A",
+                            "Confianza Dato": confianza_fmt,
+                            "Alertas Caida": alertas_str,
+                            "RSI": f"{rsi_valor:.1f}",
+                            "Beta": f"{beta_valor:.2f}" if beta_valor else "N/A",
+                            "Alerta Volatilidad": "⚠️ BETA ALTO" if beta_valor and beta_valor > 2.0 else "⚡ Volatil" if beta_valor and beta_valor > 1.5 else "",
+                            "Volumen H.F.": "N/A",
+                            "Dividendo": formatear_dividendo(div_yield),
+                            "Interes Inst.": "🎯 FUERTE" if pct_inst and pct_inst > 0.5 else "🎯 MODERADO" if pct_inst else "🎯 DEBIL",
+                            "Pct Institucional": f"{pct_inst*100:.1f}%" if pct_inst else "N/A",
+                            "Market Cap": formatear_market_cap(market_cap),
+                            "Sector": sector or "N/A",
+                            "Moneda": moneda,
+                            "Motivos": " | ".join(motivos) if motivos else "Sin fortalezas"
+                        })
+                    except Exception as e:
+                        pass
+
+                barra.empty()
+
+                if resultados:
+                    df_resultados = pd.DataFrame(resultados)
+                    df_resultados = df_resultados.sort_values("Score", ascending=False).reset_index(drop=True)
+
+                    st.write("### 🏆 Resultados del Análisis")
+                    st.dataframe(df_resultados, use_container_width=True)
+
+                    # Top oportunidades
+                    top = df_resultados[df_resultados["Score"] >= 7].head(5)
+                    if not top.empty:
+                        st.write("### 🎯 Top Oportunidades (Score ≥ 7)")
+                        st.dataframe(top[["Ticker", "Score", "Precio", "Crecimiento Anualizado", 
+                                         "Upside Analista", "Dividendo"]], use_container_width=True)
+
+                    # Propuestas de compra
+                    cartera_actual = st.session_state.cartera_compras
+                    if not isinstance(cartera_actual, pd.DataFrame):
+                        cartera_actual = pd.DataFrame()
+
+                    en_cartera = set(cartera_actual["Ticker"].tolist()) if not cartera_actual.empty else set()
+                    disponibles = [r for r in resultados if r["Ticker"] not in en_cartera and r["Score"] >= 7]
+
+                    if disponibles and len(cartera_actual) < max_activos:
+                        st.write("### 💰 Propuestas de Compra")
+                        puede_comprar, msg = puede_comprar_esta_semana(len(disponibles[:max_compras_sem]))
+                        if puede_comprar:
+                            for r in disponibles[:max_compras_sem]:
+                                st.success(f"🟢 {r['Ticker']}: Score {r['Score']}/10 | {r['Precio']} | "
+                                          f"Momentum: {r['Crecimiento Anualizado']} | Upside: {r['Upside Analista']}")
+                        else:
+                            st.info(f"⏳ {msg}")
+                    elif len(cartera_actual) >= max_activos:
+                        st.info(f"📊 Cartera llena: {len(cartera_actual)}/{max_activos} posiciones")
+
+                        # Sugerir sustitución
+                        top_no_cartera = [r for r in resultados if r["Ticker"] not in en_cartera and r["Score"] >= 7][:2]
+                        if top_no_cartera:
+                            st.write("**Sustituciones sugeridas:**")
+                            # Encontrar la peor posición actual
+                            peor_score = 999
+                            peor_ticker = None
+                            for t in en_cartera:
+                                row_t = df_resultados[df_resultados["Ticker"] == t]
+                                if not row_t.empty:
+                                    s = row_t["Score"].iloc[0]
+                                    if s < peor_score:
+                                        peor_score = s
+                                        peor_ticker = t
+
+                            for nuevo in top_no_cartera:
+                                if peor_ticker and nuevo["Score"] > peor_score:
+                                    st.write(f"🔄 Vender {peor_ticker} (Score {peor_score}) → Comprar {nuevo['Ticker']} (Score {nuevo['Score']})")
+                    else:
+                        st.info("Todas las top oportunidades ya están en cartera")
+                else:
+                    st.warning("No se pudieron analizar activos. Verifica la conexión.")
+
     with col_btn2:
         if st.button("🗑️ Resetear Cartera"):
             st.session_state.cartera_compras = pd.DataFrame()
@@ -1510,4 +1687,3 @@ with pestaña3:
 
 st.write("---")
 st.caption("Centro de Mando Financiero Pro v6.1 | Motor de Analisis Limpio + Contexto de Caida | Streamlit + yFinance")
-
