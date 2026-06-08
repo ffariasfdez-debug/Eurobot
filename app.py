@@ -357,6 +357,22 @@ with pestaña_bot:
     with col3:
         st.metric("Posiciones", f"{len(datos['posiciones'])}/{MAX_POSICIONES}")
 
+    # Botón de reset visible
+    st.write("---")
+    col_reset, col_info = st.columns([1, 3])
+    with col_reset:
+        if st.button("🗑️ BORRAR CARTERA COMPLETA", type="secondary"):
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
+            st.success("✅ Cartera borrada completamente. Recarga la página.")
+            st.rerun()
+    with col_info:
+        st.info("⚠️ Esto borra todas las posiciones y el historial. Usa solo si necesitas empezar de cero.")
+        st.metric("Capital Disponible", f"{datos['capital_disponible']:,.0f}€")
+
+    with col3:
+        st.metric("Posiciones", f"{len(datos['posiciones'])}/{MAX_POSICIONES}")
+
     # Métricas de cartera
     if datos["posiciones"]:
         pnl_total = 0
@@ -380,6 +396,19 @@ with pestaña_bot:
 # ============================================================================
 with pestaña_cartera:
     st.write(f"### 📈 Cartera ({len(datos['posiciones'])}/{MAX_POSICIONES} posiciones)")
+
+    # Botón de reset visible
+    col_reset, col_info = st.columns([1, 3])
+    with col_reset:
+        if st.button("🗑️ BORRAR CARTERA COMPLETA", key="reset_cartera"):
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
+            st.success("✅ Cartera borrada. Recarga la página.")
+            st.rerun()
+    with col_info:
+        st.info("⚠️ Borra todas las posiciones y reinicia el capital a 30.000€")
+
+    st.write("---")
 
     if datos["posiciones"]:
         cartera_data = []
@@ -408,6 +437,7 @@ with pestaña_cartera:
                     precio_apertura_hoy = pos["precio"]
 
                 precio_entrada = pos["precio"]
+                nombre = pos.get("nombre", ticker)
 
                 # Rentabilidad del día (desde apertura)
                 rend_dia_eur = pos["cantidad"] * (precio_actual - precio_apertura_hoy)
@@ -456,7 +486,7 @@ with pestaña_cartera:
                 color_acum = "🟢" if rend_acum_pct >= 0 else "🔴"
 
                 cartera_data.append({
-                    "Nombre": pos.get("nombre", ticker),
+                    "Nombre": nombre,
                     "Ticker": ticker,
                     "Fecha Compra": pos["fecha"],
                     "Precio Entrada": f"{precio_entrada:.2f}€",
@@ -493,12 +523,30 @@ with pestaña_cartera:
 
         # Resumen
         if cartera_data:
-            total_acum_pct = sum([float(row["Rend. Acum. 🟢"].split('%')[0]) if "Rend. Acum. 🟢" in row else float(row["Rend. Acum. 🔴"].split('%')[0]) for row in cartera_data])
-            total_acum_eur = sum([float(row["Rend. Acum. 🟢"].split('(')[1].split('€')[0]) if "Rend. Acum. 🟢" in row else float(row["Rend. Acum. 🔴"].split('(')[1].split('€')[0]) for row in cartera_data])
-            total_dia_pct = sum([float(row["Rend. Día 🟢"].split('%')[0]) if "Rend. Día 🟢" in row else float(row["Rend. Día 🔴"].split('%')[0]) for row in cartera_data])
-            total_dia_eur = sum([float(row["Rend. Día 🟢"].split('(')[1].split('€')[0]) if "Rend. Día 🟢" in row else float(row["Rend. Día 🔴"].split('(')[1].split('€')[0]) for row in cartera_data])
+            total_acum_pct = 0
+            total_acum_eur = 0
+            total_dia_pct = 0
+            total_dia_eur = 0
+            acums = []
 
-            acums = [float(row["Rend. Acum. 🟢"].split('%')[0]) if "Rend. Acum. 🟢" in row else float(row["Rend. Acum. 🔴"].split('%')[0]) for row in cartera_data]
+            for row in cartera_data:
+                try:
+                    acum_key = [k for k in row.keys() if "Rend. Acum." in k][0]
+                    acum_str = row[acum_key]
+                    acum_pct = float(acum_str.split('%')[0])
+                    acum_eur = float(acum_str.split('(')[1].split('€')[0])
+                    total_acum_pct += acum_pct
+                    total_acum_eur += acum_eur
+                    acums.append(acum_pct)
+
+                    dia_key = [k for k in row.keys() if "Rend. Día" in k][0]
+                    dia_str = row[dia_key]
+                    dia_pct = float(dia_str.split('%')[0])
+                    dia_eur = float(dia_str.split('(')[1].split('€')[0])
+                    total_dia_pct += dia_pct
+                    total_dia_eur += dia_eur
+                except:
+                    pass
 
             col_r1, col_r2, col_r3, col_r4 = st.columns(4)
             with col_r1:
@@ -521,9 +569,6 @@ with pestaña_cartera:
     else:
         st.info("Sin operaciones.")
 
-# ============================================================================
-# PESTAÑA 3: CONFIGURACION DE LISTAS
-# ============================================================================
 with pestaña_config:
     st.subheader("⚙️ Gestión de Listas de Acciones")
     st.write("Aquí puedes añadir o quitar acciones de cada índice. Los cambios se guardan automáticamente.")
