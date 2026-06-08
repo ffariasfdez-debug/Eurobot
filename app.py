@@ -113,28 +113,44 @@ def analizar_tendencia(ticker):
         if df.empty or len(df) < 50:
             return None, "Sin datos"
 
-        sma10 = df['Close'].rolling(window=10).mean().iloc[-1]
-        sma50 = df['Close'].rolling(window=50).mean().iloc[-1]
-        precio_actual = df['Close'].iloc[-1]
+        # Manejar MultiIndex de yfinance
+        if isinstance(df.columns, pd.MultiIndex):
+            close_col = ('Close', ticker)
+            if close_col not in df.columns:
+                close_col = 'Close'
+        else:
+            close_col = 'Close'
+
+        precios = df[close_col].squeeze()
+        if isinstance(precios, pd.DataFrame):
+            precios = precios.iloc[:, 0]
+
+        sma10 = precios.rolling(window=10).mean().iloc[-1]
+        sma50 = precios.rolling(window=50).mean().iloc[-1]
+        precio_actual = precios.iloc[-1]
 
         # Calcular RSI
-        delta = df['Close'].diff()
+        delta = precios.diff()
         ganancia = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         perdida = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = ganancia / perdida
         rsi = 100 - (100 / (1 + rs))
-        rsi_valor = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
+        rsi_valor = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
 
-        tendencia_alcista = float(sma10) > float(sma50)
-        fuerza = "FUERTE" if float(precio_actual) > float(sma10) else "DEBIL"
+        sma10_val = float(sma10.item() if hasattr(sma10, 'item') else sma10)
+        sma50_val = float(sma50.item() if hasattr(sma50, 'item') else sma50)
+        precio_val = float(precio_actual.item() if hasattr(precio_actual, 'item') else precio_actual)
+
+        tendencia_alcista = sma10_val > sma50_val
+        fuerza = "FUERTE" if precio_val > sma10_val else "DEBIL"
 
         return {
-            "precio": round(float(precio_actual), 2),
-            "sma10": round(float(sma10), 2),
-            "sma50": round(float(sma50), 2),
+            "precio": round(precio_val, 2),
+            "sma10": round(sma10_val, 2),
+            "sma50": round(sma50_val, 2),
             "tendencia": tendencia_alcista,
             "fuerza": fuerza,
-            "rsi": round(float(rsi_valor), 1),
+            "rsi": round(rsi_valor, 1),
             "nombre": [k for k, v in CALADEROS.items() if v == ticker][0]
         }, "OK"
     except Exception as e:
@@ -262,7 +278,10 @@ for ticker, pos in datos["posiciones"].items():
     try:
         df = yf.download(ticker, period="1d", interval="1m", progress=False)
         if not df.empty:
-            precio_actual = float(df['Close'].iloc[-1])
+            close_col = 'Close'
+            if isinstance(df.columns, pd.MultiIndex):
+                close_col = ('Close', ticker) if ('Close', ticker) in df.columns else 'Close'
+            precio_actual = float(df[close_col].iloc[-1].item() if hasattr(df[close_col].iloc[-1], 'item') else df[close_col].iloc[-1])
             valor_actual = pos["cantidad"] * precio_actual
             pnl_total += valor_actual - pos["invertido"]
     except:
@@ -307,14 +326,30 @@ if datos["posiciones"]:
             df_hoy = yf.download(ticker, period="2d", interval="1d", progress=False)
             df_1min = yf.download(ticker, period="1d", interval="1m", progress=False)
 
+            def get_scalar(val):
+                if hasattr(val, 'item'):
+                    return float(val.item())
+                elif isinstance(val, pd.Series):
+                    return float(val.iloc[0])
+                return float(val)
+
             if not df_hoy.empty and len(df_hoy) >= 2:
-                precio_cierre_ayer = float(df_hoy['Close'].iloc[-2])
-                precio_apertura_hoy = float(df_hoy['Open'].iloc[-1])
-                precio_actual = float(df_hoy['Close'].iloc[-1])
+                close_col = 'Close'
+                open_col = 'Open'
+                if isinstance(df_hoy.columns, pd.MultiIndex):
+                    close_col = ('Close', ticker) if ('Close', ticker) in df_hoy.columns else 'Close'
+                    open_col = ('Open', ticker) if ('Open', ticker) in df_hoy.columns else 'Open'
+
+                precio_cierre_ayer = get_scalar(df_hoy[close_col].iloc[-2])
+                precio_apertura_hoy = get_scalar(df_hoy[open_col].iloc[-1])
+                precio_actual = get_scalar(df_hoy[close_col].iloc[-1])
 
                 # Si tenemos datos intradía más recientes, usarlos
                 if not df_1min.empty:
-                    precio_actual = float(df_1min['Close'].iloc[-1])
+                    close_col_1m = 'Close'
+                    if isinstance(df_1min.columns, pd.MultiIndex):
+                        close_col_1m = ('Close', ticker) if ('Close', ticker) in df_1min.columns else 'Close'
+                    precio_actual = get_scalar(df_1min[close_col_1m].iloc[-1])
             else:
                 precio_cierre_ayer = pos["precio"]
                 precio_apertura_hoy = pos["precio"]
@@ -332,14 +367,22 @@ if datos["posiciones"]:
             try:
                 df_atr = yf.download(ticker, period="1mo", interval="1d", progress=False)
                 if not df_atr.empty and len(df_atr) >= 14:
-                    high_low = df_atr['High'] - df_atr['Low']
-                    high_close = abs(df_atr['High'] - df_atr['Close'].shift())
-                    low_close = abs(df_atr['Low'] - df_atr['Close'].shift())
-                    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-                    atr = tr.rolling(window=14).mean().iloc[-1]
+                    close_col = 'Close'
+                    high_col = 'High'
+                    low_col = 'Low'
+                    if isinstance(df_atr.columns, pd.MultiIndex):
+                        close_col = ('Close', ticker) if ('Close', ticker) in df_atr.columns else 'Close'
+                        high_col = ('High', ticker) if ('High', ticker) in df_atr.columns else 'High'
+                        low_col = ('Low', ticker) if ('Low', ticker) in df_atr.columns else 'Low'
 
-                    stop_loss = pos["precio"] - (atr * 2)  # 2x ATR debajo
-                    take_profit = pos["precio"] + (atr * 3)  # 3x ATR arriba
+                    high_low = df_atr[high_col].squeeze() - df_atr[low_col].squeeze()
+                    high_close = abs(df_atr[high_col].squeeze() - df_atr[close_col].shift().squeeze())
+                    low_close = abs(df_atr[low_col].squeeze() - df_atr[close_col].shift().squeeze())
+                    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                    atr_val = float(tr.rolling(window=14).mean().iloc[-1])
+
+                    stop_loss = pos["precio"] - (atr_val * 2)  # 2x ATR debajo
+                    take_profit = pos["precio"] + (atr_val * 3)  # 3x ATR arriba
                 else:
                     stop_loss = pos["precio"] * 0.95  # -5%
                     take_profit = pos["precio"] * 1.15  # +15%
