@@ -456,7 +456,7 @@ with pestaña_cartera:
                 color_acum = "🟢" if rend_acum_pct >= 0 else "🔴"
 
                 cartera_data.append({
-                    "Nombre": pos["nombre"],
+                    "Nombre": pos.get("nombre", ticker),
                     "Ticker": ticker,
                     "Fecha Compra": pos["fecha"],
                     "Precio Entrada": f"{precio_entrada:.2f}€",
@@ -473,7 +473,7 @@ with pestaña_cartera:
             except Exception as e:
                 st.warning(f"Error {ticker}: {e}")
                 cartera_data.append({
-                    "Nombre": pos["nombre"],
+                    "Nombre": pos.get("nombre", ticker),
                     "Ticker": ticker,
                     "Fecha Compra": pos["fecha"],
                     "Precio Entrada": f"{pos['precio']:.2f}€",
